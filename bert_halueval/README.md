@@ -1,102 +1,232 @@
-# BERT-based Hallucination Detection with HaluEval QA
+# HaluEval Hallucination Detection
 
-Fine-tunes `bert-base-uncased` as a binary classifier on HaluEval's QA task.
+This repository fine-tunes `bert-base-uncased` to classify a HaluEval QA answer
+as reference-grounded (`0`, not hallucinated) or benchmark-labeled hallucinated
+(`1`). Reusable data preparation and evaluation live in the root `common`
+package so later model experiments can share the same examples and source-level
+splits.
 
-## 1. Dataset placement
-
-Use the repository's QA dataset and keep your current directory layout:
+## Project layout
 
 ```text
 LLM-Hallucination-Detection/
-├── data/
-│   ├── qa_data.json        # HaluEval QA file (JSON or JSONL accepted)
-│   ├── dialogue_data.json
-│   ├── general_data.json
-│   └── summarization_data.json
+├── common/
+│   ├── __init__.py
+│   ├── preprocessing.py
+│   └── evaluation.py
 ├── bert_halueval/
 │   ├── README.md
 │   └── src/
 │       ├── train_bert.py
 │       └── predict.py
-├── requirements.txt
-└── .venv/
+├── data/
+│   ├── qa_data.json
+│   └── splits/
+│       └── qa_split_seed42.json
+└── outputs/
+    └── <experiment-name>/
 ```
 
-The HaluEval repository currently documents the file as `data/qa_data.json` (JSON) with `knowledge`, `question`, `right_answer`, and `hallucinated_answer` fields. Your screenshot's `qa_data.json` filename is fine; no conversion to `.jsonl` is needed. If your local file really is named `qa_data.jsonl`, pass it via `--data data/qa_data.jsonl`.
+## Shared components
 
-## 2. Environment setup
+- `common/preprocessing.py` loads JSON, wrapped JSON, and JSONL; validates and
+  constructs paired answer examples; creates and validates source-level split
+  manifests; and tokenizes inputs with knowledge-first truncation.
+- `common/evaluation.py` computes class metrics, ROC-AUC, classification
+  reports, confusion matrices, prediction CSVs, inference latency, peak CUDA
+  memory, and JSON result files. It contains no model-specific code.
+- `bert_halueval/src/train_bert.py` handles BERT model/tokenizer setup, dynamic
+  batch padding, training arguments, validation-based checkpoint selection,
+  final test inference, and experiment measurements.
+- `bert_halueval/src/predict.py` is the interactive inference app. It loads the
+  saved model directly and does not import training code.
 
-Open a terminal at the project root, activate your virtual environment, then run:
+## Environment setup
 
-```bash
-python -m venv .venv
-# Windows PowerShell:
-.venv\Scripts\Activate.ps1
-# macOS/Linux:
-# source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+From the project root in PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r .\requirements.txt
 ```
 
-For this project's Windows NVIDIA GPU setup, install the CUDA-enabled PyTorch build after the other requirements:
+For the project's NVIDIA GPU configuration, install a CUDA-enabled PyTorch
+build after the other requirements:
 
 ```powershell
 python -m pip install --upgrade torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CUDA unavailable')"
 ```
 
-The training script automatically uses CUDA and mixed precision when `torch.cuda.is_available()` is true; it prints the selected device before training. If adapting this setup to another GPU, choose a compatible PyTorch build from the official [PyTorch installation selector](https://pytorch.org/get-started/locally/). CPU training remains available but may be slow.
+Training automatically selects CUDA when available. `--precision auto` uses
+FP16 on CUDA and full precision on CPU. Use `--precision no`, `--precision
+fp16`, or supported `--precision bf16` to choose explicitly.
 
-## 3. Quick smoke test
+## Split manifests
 
-First run on 100 source records to verify the data, environment, tokenizer, and training loop:
+Source IDs refer to original source-record positions; the correct and
+hallucinated answer for one record always stay in the same partition. The
+manifest records the train/validation/test source IDs, seed, proportions,
+format version, dataset fingerprint, and usable source IDs. A fingerprint or
+split mismatch is an error; the program never silently replaces an existing
+incompatible manifest.
 
-```bash
-python .\bert_halueval\src\train_bert.py --data .\data\qa_data.json --limit 100 --epochs 1 --batch-size 2
+The default manifest is `data/splits/qa_split_seed42.json`. By default,
+`--split-manifest-mode auto` creates it if missing and reuses it if present.
+To create a new manifest explicitly at a new path without starting training:
+
+```powershell
+python .\bert_halueval\src\train_bert.py `
+  --split-manifest .\data\splits\qa_split_seed42_experiment.json `
+  --split-manifest-mode create `
+  --prepare-splits-only
 ```
 
-If the file uses `.jsonl`, replace the path accordingly. The model downloads from Hugging Face the first time.
+To reuse that manifest for training:
 
-## 4. Train on the full QA dataset
-
-```bash
-python .\bert_halueval\src\train_bert.py --data .\data\qa_data.json --epochs 3 --batch-size 2
+```powershell
+python .\bert_halueval\src\train_bert.py `
+  --split-manifest .\data\splits\qa_split_seed42_experiment.json `
+  --split-manifest-mode reuse `
+  --data .\data\qa_data.json `
+  --model bert-base-uncased `
+  --output-dir .\outputs\bert-halueval-qa `
+  --epochs 3 `
+  --batch-size 2
 ```
 
-The batch size of 2 is a safer starting point for GPUs with 4 GB of memory. If your GPU has more memory, increase it gradually. To reduce sequence truncation, test `--max-length 384` if GPU memory allows. Defaults are `bert-base-uncased`, max length 256, learning rate 2e-5, and 3 epochs.
+Use that same manifest path and split configuration for every model comparison.
+An intentional replacement requires both `--split-manifest-mode create` and
+`--replace-split-manifest`; normally create a different manifest path instead.
+The dataset fingerprint ensures a manifest is not accidentally reused for
+different or modified data. A limited smoke-test dataset is a different
+dataset, so give it its own manifest.
+Add `--prepare-splits-only` to the reuse command to validate a manifest without
+training.
 
-Artifacts go to:
+## Train BERT
+
+Run this command from the project root:
+
+```powershell
+python .\bert_halueval\src\train_bert.py `
+  --data .\data\qa_data.json `
+  --model bert-base-uncased `
+  --output-dir .\outputs\bert-halueval-qa `
+  --split-manifest .\data\splits\qa_split_seed42.json `
+  --split-manifest-mode auto `
+  --epochs 3 `
+  --batch-size 2 `
+  --gradient-accumulation-steps 1 `
+  --precision auto
+```
+
+If the existing environment is not activated, replace `python` with
+`.\.venv\Scripts\python.exe`.
+
+Quick smoke test using a separate 100-record split manifest and output folder:
+
+```powershell
+python .\bert_halueval\src\train_bert.py `
+  --data .\data\qa_data.json `
+  --limit 100 `
+  --epochs 1 `
+  --batch-size 2 `
+  --split-manifest .\data\splits\qa_smoke_seed42.json `
+  --split-manifest-mode create `
+  --output-dir .\outputs\bert-smoke
+```
+
+The effective batch size is
+`per-device batch size × gradient accumulation steps × number of devices`.
+For example, batch size 2 and accumulation 4 on one GPU yields an effective
+batch size of 8. The default accumulation is 1. On a 4 GB GPU, start with batch
+size 2 and reduce it if CUDA runs out of memory.
+
+Training selects the best checkpoint using validation hallucination-class F1.
+The test set is evaluated only after that checkpoint is selected and does not
+participate in checkpoint selection or parameter tuning. Non-finite training
+or validation loss stops the run with an error.
+
+### Input truncation and padding
+
+The model input uses the same field format as before:
 
 ```text
-outputs/bert-halueval-qa/
-├── checkpoints/
-├── model/             # best fine-tuned model and tokenizer
-└── test_results.json  # held-out metrics and confusion matrix
+Knowledge: {knowledge}
+Question: {question}
+Candidate answer: {answer}
 ```
 
-The split is made by original source record, so the correct and hallucinated answers associated with one question do not cross between train, validation, and test sets. The test set is only used for final evaluation.
+Inputs that fit are tokenized as a whole. When an input exceeds `--max-length`,
+the knowledge passage is truncated first; the question and candidate answer
+are retained if they fit. If they do not fit together, the candidate answer is
+prioritized and the question is truncated from its end. If the answer alone is
+too long, it is truncated from its end. Model special tokens are included in
+the length limit. Batches use dynamic padding to the longest sequence in that
+batch rather than padding every example to the maximum. Truncation counts are
+printed for each dataset split.
 
-## 5. Interactive prediction and report
+## Outputs and schemas
 
-```bash
-python .\bert_halueval\src\predict.py --model-dir .\outputs\bert-halueval-qa\model
+For `--output-dir .\outputs\bert-halueval-qa`, training writes:
+
+- `model/`: the selected model and tokenizer.
+- `checkpoints/`: Trainer checkpoints used for validation-based selection.
+- `test_results.json`: stable JSON containing schema version, label mapping,
+  accuracy, hallucination precision/recall/F1, macro-F1, hallucinated-class
+  ROC-AUC, confusion matrix, full classification report, and experiment
+  metadata. Undefined ROC-AUC is `null` with an explanatory reason.
+- `test_predictions.csv`: one row per test example with
+  `source_record_id`, `true_label`, `predicted_label`,
+  `probability_not_hallucinated`, and `probability_hallucinated`.
+- `experiment_metadata.json`: standalone metadata, including model checkpoint,
+  seed, max sequence length, batch/accumulation/effective batch sizes, learning
+  rate, epochs, precision, split-manifest path, training duration, peak GPU
+  memory (`null` when unavailable), and test inference latency.
+
+Inference latency is measured for one complete test-set inference pass after
+model loading, including data-loader overhead, with CUDA synchronization before
+and after the pass. The reported latency is average milliseconds per example.
+
+## Interactive prediction
+
+```powershell
+python .\bert_halueval\src\predict.py `
+  --model-dir .\outputs\bert-halueval-qa\model
 ```
 
-Enter the relevant knowledge/facts, question, and candidate answer when prompted. After each result, enter `y` or `n` to record its known ground-truth label, or `skip` if the truth is unknown. Type `exit` at any prompt to finish. A JSON report containing each prediction and accuracy metrics for labeled predictions is saved under `outputs/`; pass `--report-path PATH` to choose another file. The model uses CUDA automatically when available.
+Enter knowledge, question, and candidate answer at the prompts. The app uses
+the same shared tokenizer truncation behavior as training, and uses CUDA when
+available.
 
-## 6. What the labels mean
+## Interpreting results and comparing models
 
-- `0`: `right_answer`, a not-hallucinated / reference-grounded answer.
-- `1`: `hallucinated_answer`, a hallucinated answer produced for the benchmark.
+- **Accuracy** is the fraction of correctly classified test examples.
+- **Hallucination precision** is the fraction of predicted hallucinations that
+  are labeled hallucinated.
+- **Hallucination recall** is the fraction of labeled hallucinations detected.
+- **Hallucination F1** is the harmonic mean of hallucination precision and
+  recall. **Macro-F1** averages F1 across both classes.
+- **ROC-AUC** measures ranking quality from the hallucinated-class probability;
+  it is unavailable if the test labels contain only one class.
 
-For each record, the training script creates two examples. Each model input includes the knowledge, question, and candidate answer. This makes the task a supervised, context-aware answer classification problem. At inference time, provide the relevant knowledge as well as the question and answer.
+Compare models using the same dataset, split manifest, and held-out test set.
+HaluEval labels are benchmark annotations, not a universal guarantee of truth.
+High in-domain benchmark scores do not establish reliable performance on
+arbitrary domain-specific inputs; collect and evaluate domain-representative
+held-out labels before relying on a detector.
 
-## 7. Evaluation and limitations
+## Dependencies
 
-Review `test_results.json` and focus on hallucination-class precision, recall and F1, as well as macro-F1 and the confusion matrix. Accuracy alone may hide which class is harder to detect. The generated `right_answer` and `hallucinated_answer` labels are benchmark labels, not a universal guarantee that every answer is objectively true or false. Results may not generalize to other domains or model styles without further evaluation.
+Install the root `requirements.txt`. No additional evaluation or test framework
+dependency is required; the focused unit tests use the Python standard-library
+`unittest` runner.
 
 ## Citation
 
-Li, J., Cheng, X., Zhao, W. X., Nie, J.-Y., & Wen, J.-R. (2023). *HaluEval: A Large-Scale Hallucination Evaluation Benchmark for Large Language Models*. https://arxiv.org/abs/2305.11747
+Li, J., Cheng, X., Zhao, W. X., Nie, J.-Y., & Wen, J.-R. (2023). *HaluEval: A
+Large-Scale Hallucination Evaluation Benchmark for Large Language Models*.
+https://arxiv.org/abs/2305.11747
 
 Dataset repository: https://github.com/RUCAIBox/HaluEval

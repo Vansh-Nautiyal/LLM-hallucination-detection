@@ -1,377 +1,362 @@
-"""Fine-tune BERT to classify HaluEval QA answers as factual or hallucinated.
-The model receives knowledge + question + candidate answer, so it can judge the
-candidate in context instead of learning from the answer alone.
-"""
-
+"""Fine-tune BERT to classify HaluEval QA answers as factual or hallucinated."""
 from __future__ import annotations
 
 import argparse
-import json
-import random
+import inspect
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from sklearn.metrics import (accuracy_score, classification_report,
-                             confusion_matrix, f1_score, precision_score,
-                             recall_score)
-from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
-                          Trainer, TrainingArguments, set_seed)
+                          DataCollatorWithPadding, Trainer, TrainerCallback,
+                          TrainingArguments, set_seed)
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
-LABELS = {0: "not_hallucinated", 1: "hallucinated"}
-
-
-def read_records(path: Path) -> list[dict[str, Any]]:
-    """Read either standard JSON (list of objects) or JSONL (one object per line)."""
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Dataset not found: {path}\n"
-            "Put HaluEval's qa_data.json in the project's data/ folder, or pass --data PATH."
-        )
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        raise ValueError(f"Dataset file is empty: {path}")
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            # Handles JSON objects wrapping records in a common collection key.
-            for key in ("data", "records", "examples"):
-                if isinstance(parsed.get(key), list):
-                    parsed = parsed[key]
-                    break
-            else:
-                parsed = [parsed]
-        if not isinstance(parsed, list):
-            raise ValueError("JSON dataset must contain a list of records.")
-        records = parsed
-    except json.JSONDecodeError:
-        records = []
-        for line_no, line in enumerate(raw.splitlines(), 1):
-            if not line.strip():
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSON/JSONL at line {line_no}: {exc}") from exc
-            if not isinstance(item, dict):
-                raise ValueError(f"JSONL line {line_no} is not a JSON object.")
-            records.append(item)
-    if not records:
-        raise ValueError(f"No records found in {path}")
-    if not all(isinstance(row, dict) for row in records):
-        raise ValueError("Every dataset record must be a JSON object.")
-    return records
-
-
-def make_examples(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert every QA record into a factual and hallucinated answer example."""
-    required = {"knowledge", "question", "right_answer", "hallucinated_answer"}
-    missing = required - set().union(*(row.keys() for row in records))
-    if missing:
-        sample_keys = sorted(records[0].keys())
-        raise ValueError(
-            f"Missing required HaluEval fields: {sorted(missing)}. "
-            f"First record contains: {sample_keys}"
-        )
-    
-
-    examples: list[dict[str, Any]] = []
-    skipped = 0
-    for idx, row in enumerate(records):
-        knowledge = str(row.get("knowledge", "") or "").strip()
-        question = str(row.get("question", "") or "").strip()
-        right = str(row.get("right_answer", "") or "").strip()
-        hallucinated = str(row.get("hallucinated_answer", "") or "").strip()
-        if not all([knowledge, question, right, hallucinated]):
-            skipped += 1
-            continue
-        if not question or (not right and not hallucinated):
-            skipped += 1
-            continue
-        # Use structured markers to make field roles explicit to the encoder.
-        prefix = f"Knowledge: {knowledge}\nQuestion: {question}\nCandidate answer: "
-        if right:
-            examples.append({"text": prefix + right, "label": 0, "source_id": idx})
-        if hallucinated:
-            examples.append({"text": prefix + hallucinated, "label": 1, "source_id": idx})
-    if skipped:
-        print(f"Skipped {skipped} rows with empty question or both answers missing.")
-    if not examples:
-        raise ValueError("No usable examples after preprocessing.")
-    return examples
+from common.evaluation import (compute_metrics, generate_classification_report,
+                               generate_confusion_matrix,
+                               measure_inference_latency, peak_gpu_memory_mb,
+                               save_evaluation_results, save_test_predictions)
+from common.preprocessing import (LABELS, create_or_load_splits, make_examples,
+                                  read_records, tokenize_example_with_stats)
 
 
 class HaluEvalDataset(Dataset):
+    """Tokenize examples with knowledge-first truncation."""
+
     def __init__(self, examples: list[dict[str, Any]], tokenizer, max_length: int):
         self.examples = examples
-        self.encodings = tokenizer(
-            [item["text"] for item in examples],
-            truncation=True,
-            padding="max_length",
-            max_length=max_length,
-        )
+        self.encodings = []
+        self.knowledge_truncated = 0
+        self.question_or_answer_truncated = 0
+        for example in examples:
+            encoding, stats = tokenize_example_with_stats(
+                tokenizer,
+                example["knowledge"],
+                example["question"],
+                example["answer"],
+                max_length,
+            )
+            self.encodings.append(encoding)
+            self.knowledge_truncated += int(stats["knowledge_truncated"])
+            self.question_or_answer_truncated += int(
+                stats["question_or_answer_truncated"]
+            )
 
     def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        item = {key: torch.tensor(value[idx], dtype=torch.long)
-                for key, value in self.encodings.items()}
-        item["labels"] = torch.tensor(self.examples[idx]["label"], dtype=torch.long)
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        item = {
+            key: torch.tensor(value, dtype=torch.long)
+            for key, value in self.encodings[index].items()
+        }
+        item["labels"] = torch.tensor(
+            self.examples[index]["label"], dtype=torch.long
+        )
         return item
 
 
-''' Old Function
-def split_by_source(examples: list[dict[str, Any]], test_size: float,
-                    val_size: float, seed: int):
-    """Split by original QA record so paired right/hallucinated answers don't leak."""
-    source_ids = sorted({e["source_id"] for e in examples})
-    labels_by_source: dict[int, int] = {}
-    for e in examples:
-        # Original record is generally represented by both classes.
-        labels_by_source.setdefault(e["source_id"], e["label"])
-    train_val_ids, test_ids = train_test_split(
-        source_ids, test_size=test_size, random_state=seed,
-        stratify=[labels_by_source[i] for i in source_ids],
-    )
-    val_fraction_of_remaining = val_size / (1.0 - test_size)
-    train_ids, val_ids = train_test_split(
-        train_val_ids, test_size=val_fraction_of_remaining, random_state=seed,
-        stratify=[labels_by_source[i] for i in train_val_ids],
-    )
-    train_set, val_set, test_set = set(train_ids), set(val_ids), set(test_ids)
-    return (
-        [e for e in examples if e["source_id"] in train_set],
-        [e for e in examples if e["source_id"] in val_set],
-        [e for e in examples if e["source_id"] in test_set],
-    )
-'''
+class FailOnNonFiniteLoss(TrainerCallback):
+    """Stop training immediately if a logged training or validation loss is invalid."""
 
-def split_by_source(
-    examples: list[dict],
-    test_size: float,
-    val_size: float,
-    seed: int,
-):
-    """Split by source ID so paired answers cannot leak across partitions."""
-    source_ids = sorted({e["source_id"] for e in examples})
-
-    if len(source_ids) < 3:
-        raise ValueError("Need at least 3 source records to create data splits.")
-
-    # Every retained source must have exactly one example of each class.
-    labels_per_source = {}
-    for example in examples:
-        labels_per_source.setdefault(example["source_id"], []).append(
-            example["label"]
-        )
-
-    for source_id, labels in labels_per_source.items():
-        if sorted(labels) != [0, 1]:
-            raise ValueError(
-                f"Source {source_id} must have exactly one example "
-                f"of each class; found labels {labels}."
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        loss = (logs or {}).get("loss")
+        if loss is not None and not np.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite training loss at global step {state.global_step}: {loss}"
             )
 
-    # All source groups contain both classes, so stratifying by a
-    # single label per source is unnecessary and incorrect.
-    train_val_ids, test_ids = train_test_split(
-        source_ids,
-        test_size=test_size,
-        random_state=seed,
-        shuffle=True,
-    )
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        loss = (metrics or {}).get("eval_loss")
+        if loss is not None and not np.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite validation loss at global step {state.global_step}: {loss}"
+            )
 
-    val_fraction = val_size / (1.0 - test_size)
 
-    train_ids, val_ids = train_test_split(
-        train_val_ids,
-        test_size=val_fraction,
-        random_state=seed,
-        shuffle=True,
-    )
-
-    train_set = set(train_ids)
-    val_set = set(val_ids)
-    test_set = set(test_ids)
-
-    # Explicitly verify that no source appears in multiple partitions.
-    assert train_set.isdisjoint(val_set)
-    assert train_set.isdisjoint(test_set)
-    assert val_set.isdisjoint(test_set)
-
-    return (
-        [e for e in examples if e["source_id"] in train_set],
-        [e for e in examples if e["source_id"] in val_set],
-        [e for e in examples if e["source_id"] in test_set],
-    )
-
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-    return {
-        "accuracy": accuracy_score(labels, predictions),
-        "precision_hallucinated": precision_score(labels, predictions, pos_label=1, zero_division=0),
-        "recall_hallucinated": recall_score(labels, predictions, pos_label=1, zero_division=0),
-        "f1_hallucinated": f1_score(labels, predictions, pos_label=1, zero_division=0),
-        "macro_f1": f1_score(labels, predictions, average="macro", zero_division=0),
-    }
-
-def main():
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, default=Path("data/qa_data.json"))
+    parser.add_argument(
+        "--data", type=Path, default=REPOSITORY_ROOT / "data" / "qa_data.json"
+    )
     parser.add_argument("--model", default="bert-base-uncased",
                         help="Hugging Face pretrained model checkpoint")
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/bert-halueval-qa"))
+    parser.add_argument(
+        "--output-dir", type=Path,
+        default=REPOSITORY_ROOT / "outputs" / "bert-halueval-qa",
+    )
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--epochs", type=float, default=3.0)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--test-size", type=float, default=0.10)
     parser.add_argument("--val-size", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--limit", type=int, default=0,
-                        help="Optional number of source records for a quick smoke test (0 = all)")
+    parser.add_argument(
+        "--limit", type=int, default=0,
+        help="Optional source-record limit for a smoke test (0 means all records)",
+    )
+    parser.add_argument(
+        "--split-manifest", type=Path,
+        default=REPOSITORY_ROOT / "data" / "splits" / "qa_split_seed42.json",
+    )
+    parser.add_argument(
+        "--split-manifest-mode",
+        choices=("auto", "create", "reuse"),
+        default="auto",
+        help="auto creates a missing manifest and reuses an existing compatible one",
+    )
+    parser.add_argument(
+        "--replace-split-manifest", action="store_true",
+        help="Allow --split-manifest-mode create to replace an existing manifest",
+    )
+    parser.add_argument(
+        "--prepare-splits-only", action="store_true",
+        help="Create or validate the split manifest without loading a model or training",
+    )
+    parser.add_argument(
+        "--precision", choices=("auto", "no", "fp16", "bf16"), default="auto",
+        help="auto uses FP16 on CUDA and full precision on CPU",
+    )
     args = parser.parse_args()
+    if args.epochs <= 0:
+        parser.error("--epochs must be greater than zero.")
+    if args.batch_size < 1 or args.gradient_accumulation_steps < 1:
+        parser.error("--batch-size and --gradient-accumulation-steps must be positive.")
+    if args.max_length < 1:
+        parser.error("--max-length must be greater than zero.")
+    if args.limit < 0:
+        parser.error("--limit must not be negative.")
+    if args.replace_split_manifest and args.split_manifest_mode != "create":
+        parser.error("--replace-split-manifest requires --split-manifest-mode create.")
+    return args
 
-    if not (0 < args.test_size < 1 and 0 < args.val_size < 1 and args.test_size + args.val_size < 1):
-        raise ValueError("test-size and val-size must be >0 and their sum must be <1.")
-    if args.max_length < 32:
-        raise ValueError("max-length should be at least 32.")
 
+def _precision_flags(precision: str) -> tuple[bool, bool]:
+    cuda_available = torch.cuda.is_available()
+    if precision == "auto":
+        return cuda_available, False
+    if precision == "no":
+        return False, False
+    if not cuda_available:
+        raise RuntimeError(f"--precision {precision} requires a CUDA-enabled GPU.")
+    if precision == "fp16":
+        return True, False
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError("--precision bf16 was requested but this GPU does not support it.")
+    return False, True
+
+
+def _compute_trainer_metrics(eval_prediction) -> dict[str, float]:
+    logits, labels = eval_prediction
+    probabilities = torch.softmax(torch.as_tensor(logits), dim=-1).cpu().numpy()
+    predictions = np.argmax(probabilities, axis=-1)
+    metrics = compute_metrics(labels, predictions, probabilities)
+    return {
+        key: value for key, value in metrics.items()
+        if isinstance(value, (float, int)) and value is not None
+    }
+
+
+def main() -> None:
+    args = _parse_args()
     set_seed(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
     if torch.cuda.is_available():
-        print(f"Training device: {torch.cuda.get_device_name(0)} "
-              f"(CUDA {torch.version.cuda}; fp16 enabled)")
+        device = torch.device("cuda")
+        torch.cuda.manual_seed_all(args.seed)
+        print(f"Training device: {torch.cuda.get_device_name(0)}")
     else:
-        print("Training device: CPU (CUDA unavailable; fp16 disabled)")
+        device = torch.device("cpu")
+        print("Training device: CPU")
 
     records = read_records(args.data)
-    if args.limit > 0:
+    if args.limit:
         records = records[:args.limit]
     examples = make_examples(records)
-    train_examples, val_examples, test_examples = split_by_source(
-        examples, args.test_size, args.val_size, args.seed
+    train_examples, val_examples, test_examples = create_or_load_splits(
+        examples,
+        records,
+        args.split_manifest,
+        test_size=args.test_size,
+        val_size=args.val_size,
+        seed=args.seed,
+        mode=args.split_manifest_mode,
+        replace=args.replace_split_manifest,
     )
-
-    # Guard Checks 
-    def source_ids_in(examples):
-        return {e["source_id"] for e in examples}
-
-
-    train_ids = source_ids_in(train_examples)
-    val_ids = source_ids_in(val_examples)
-    test_ids = source_ids_in(test_examples)
-
-    assert train_ids.isdisjoint(val_ids)
-    assert train_ids.isdisjoint(test_ids)
-    assert val_ids.isdisjoint(test_ids)
-
-    for name, partition in [
+    print(f"Split manifest: {args.split_manifest}")
+    print(
+        f"Source records: {len(records):,}; usable source records: "
+        f"{len(examples) // 2:,}; classification examples: {len(examples):,}"
+    )
+    for name, partition in (
         ("train", train_examples),
         ("validation", val_examples),
         ("test", test_examples),
-    ]:
-        labels = [e["label"] for e in partition]
-
-        assert labels.count(0) == labels.count(1), (
-            f"{name} partition is not balanced."
-        )
-
+    ):
         print(
-            f"{name}: {len(partition)} examples, "
-            f"class 0 = {labels.count(0)}, "
-            f"class 1 = {labels.count(1)}, "
-            f"source records = {len(source_ids_in(partition))}"
+            f"{name}: {len(partition):,} examples from "
+            f"{len({item['source_id'] for item in partition}):,} source records"
         )
-
-    print(f"Source records: {len(records):,}")
-    print(f"Classification examples: {len(examples):,}")
-    print(f"Train/validation/test examples: {len(train_examples):,} / "
-          f"{len(val_examples):,} / {len(test_examples):,}")
     print("Label mapping: 0 = not hallucinated, 1 = hallucinated")
+    if args.prepare_splits_only:
+        print("Split preparation complete; model loading and training were skipped.")
+        return
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model,
         num_labels=2,
         id2label=LABELS,
-        label2id={v: k for k, v in LABELS.items()},
+        label2id={value: key for key, value in LABELS.items()},
     )
-
     train_dataset = HaluEvalDataset(train_examples, tokenizer, args.max_length)
     val_dataset = HaluEvalDataset(val_examples, tokenizer, args.max_length)
     test_dataset = HaluEvalDataset(test_examples, tokenizer, args.max_length)
+    for name, dataset in (
+        ("train", train_dataset),
+        ("validation", val_dataset),
+        ("test", test_dataset),
+    ):
+        print(
+            f"{name} truncation: knowledge={dataset.knowledge_truncated}, "
+            f"question/answer={dataset.question_or_answer_truncated}"
+        )
 
+    use_fp16, use_bf16 = _precision_flags(args.precision)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    training_args = TrainingArguments(
-        output_dir=str(args.output_dir / "checkpoints"),
-        num_train_epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        weight_decay=0.01,
-        warmup_ratio=0.1,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="f1_hallucinated",
-        greater_is_better=True,
-        logging_steps=100,
-        save_total_limit=2,
-        fp16=torch.cuda.is_available(),
-        report_to="none",
-        seed=args.seed,
+    training_argument_parameters = inspect.signature(TrainingArguments).parameters
+    eval_strategy_argument = (
+        "eval_strategy"
+        if "eval_strategy" in training_argument_parameters
+        else "evaluation_strategy"
     )
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
-    )
-    trainer.train()
+    training_arguments = {
+        "output_dir": str(args.output_dir / "checkpoints"),
+        "num_train_epochs": args.epochs,
+        "learning_rate": args.learning_rate,
+        "per_device_train_batch_size": args.batch_size,
+        "per_device_eval_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.1,
+        "save_strategy": "epoch",
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "f1_hallucinated",
+        "greater_is_better": True,
+        "logging_steps": 100,
+        "save_total_limit": 2,
+        "fp16": use_fp16,
+        "bf16": use_bf16,
+        "logging_nan_inf_filter": False,
+        "report_to": "none",
+        "seed": args.seed,
+        "data_seed": args.seed,
+    }
+    training_arguments[eval_strategy_argument] = "epoch"
+    training_args = TrainingArguments(**training_arguments)
+    trainer_options = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset,
+        "eval_dataset": val_dataset,
+        "data_collator": DataCollatorWithPadding(tokenizer=tokenizer),
+        "compute_metrics": _compute_trainer_metrics,
+        "callbacks": [FailOnNonFiniteLoss()],
+    }
+    trainer_parameters = inspect.signature(Trainer).parameters
+    if "processing_class" in trainer_parameters:
+        trainer_options["processing_class"] = tokenizer
+    else:
+        trainer_options["tokenizer"] = tokenizer
+    trainer = Trainer(**trainer_options)
 
-    test_result = trainer.predict(test_dataset)
-    metrics = compute_metrics((test_result.predictions, test_result.label_ids))
-    y_pred = np.argmax(test_result.predictions, axis=-1)
-    y_true = test_result.label_ids
-    report = classification_report(
-        y_true, y_pred, labels=[0, 1],
-        target_names=[LABELS[0], LABELS[1]], output_dict=True, zero_division=0,
-    )
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    training_started = time.perf_counter()
+    trainer.train()
+    training_duration = time.perf_counter() - training_started
+    peak_memory = peak_gpu_memory_mb(device)
 
     final_model_dir = args.output_dir / "model"
     trainer.save_model(str(final_model_dir))
     tokenizer.save_pretrained(str(final_model_dir))
-    results = {
+
+    test_result, inference_latency = measure_inference_latency(
+        lambda: trainer.predict(test_dataset),
+        number_of_examples=len(test_dataset),
+        device=device,
+    )
+    true_labels = np.asarray(test_result.label_ids, dtype=int)
+    probabilities = torch.softmax(
+        torch.as_tensor(test_result.predictions), dim=-1
+    ).cpu().numpy()
+    predicted_labels = np.argmax(probabilities, axis=-1)
+    metrics = compute_metrics(true_labels, predicted_labels, probabilities)
+    report = generate_classification_report(true_labels, predicted_labels)
+    matrix = generate_confusion_matrix(true_labels, predicted_labels)
+    save_test_predictions(
+        args.output_dir / "test_predictions.csv",
+        test_examples,
+        true_labels,
+        predicted_labels,
+        probabilities,
+    )
+
+    world_size = max(1, training_args.world_size)
+    metadata = {
         "model_checkpoint": args.model,
-        "source_records": len(records),
-        "classification_examples": len(examples),
-        "split_sizes": {"train": len(train_examples), "validation": len(val_examples), "test": len(test_examples)},
-        "label_mapping": {str(k): v for k, v in LABELS.items()},
-        "test_metrics": metrics,
-        "classification_report": report,
-        "confusion_matrix_rows_true_cols_predicted": cm,
-        "model_path": str(final_model_dir),
+        "random_seed": args.seed,
+        "max_sequence_length": args.max_length,
+        "per_device_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "number_of_devices": world_size,
+        "effective_batch_size": (
+            args.batch_size * args.gradient_accumulation_steps * world_size
+        ),
+        "learning_rate": args.learning_rate,
+        "number_of_epochs": args.epochs,
+        "precision": (
+            "fp16" if use_fp16 else "bf16" if use_bf16 else "full"
+        ),
+        "split_manifest_path": str(args.split_manifest.resolve()),
+        "source_record_count": len(records),
+        "usable_source_record_count": len(examples) // 2,
+        "example_counts": {
+            "train": len(train_examples),
+            "validation": len(val_examples),
+            "test": len(test_examples),
+        },
+        "training_duration_seconds": training_duration,
+        "peak_gpu_memory_mib": peak_memory,
+        "inference_latency": inference_latency,
+        "best_checkpoint": trainer.state.best_model_checkpoint,
     }
-    (args.output_dir / "test_results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
-    print("\nTest metrics:")
-    print(json.dumps(metrics, indent=2))
-    print("\nClassification report:")
-    print(classification_report(y_true, y_pred, labels=[0, 1],
-                                target_names=[LABELS[0], LABELS[1]], zero_division=0))
-    print(f"Saved model to: {final_model_dir}")
-    print(f"Saved test report to: {args.output_dir / 'test_results.json'}")
+    save_evaluation_results(
+        args.output_dir / "test_results.json",
+        metrics=metrics,
+        report=report,
+        matrix=matrix,
+        metadata=metadata,
+    )
+
+    print("\nFinal test metrics:")
+    for name, value in metrics.items():
+        print(f"{name}: {value}")
+    print(f"Saved best model and tokenizer to: {final_model_dir}")
+    print(f"Saved test predictions to: {args.output_dir / 'test_predictions.csv'}")
+    print(f"Saved evaluation results to: {args.output_dir / 'test_results.json'}")
+    print(
+        f"Training duration: {training_duration:.2f}s; "
+        f"inference latency: {inference_latency['milliseconds_per_example']:.3f} ms/example"
+    )
 
 
 if __name__ == "__main__":

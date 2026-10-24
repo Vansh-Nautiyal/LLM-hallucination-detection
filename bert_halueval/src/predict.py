@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import torch
-from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
-                             precision_score, recall_score)
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
-LABELS = {0: "not_hallucinated", 1: "hallucinated"}
+from common.evaluation import compute_metrics, generate_confusion_matrix
+from common.preprocessing import LABELS, tokenize_example
 
 
 def summarize(records: list[dict]) -> dict:
@@ -31,25 +34,21 @@ def summarize(records: list[dict]) -> dict:
 
     true_labels = [record["true_label"] for record in labeled]
     predicted_labels = [record["predicted_label"] for record in labeled]
+    probabilities = [
+        [
+            record["probability_not_hallucinated"],
+            record["probability_hallucinated"],
+        ]
+        for record in labeled
+    ]
+    metrics = compute_metrics(true_labels, predicted_labels, probabilities)
     return {
         "labeled_predictions": len(labeled),
         "unlabeled_predictions": len(records) - len(labeled),
-        "accuracy": accuracy_score(true_labels, predicted_labels),
-        "precision_hallucinated": precision_score(
-            true_labels, predicted_labels, pos_label=1, zero_division=0
+        **metrics,
+        "confusion_matrix_rows_true_cols_predicted": generate_confusion_matrix(
+            true_labels, predicted_labels
         ),
-        "recall_hallucinated": recall_score(
-            true_labels, predicted_labels, pos_label=1, zero_division=0
-        ),
-        "f1_hallucinated": f1_score(
-            true_labels, predicted_labels, pos_label=1, zero_division=0
-        ),
-        "macro_f1": f1_score(
-            true_labels, predicted_labels, average="macro", zero_division=0
-        ),
-        "confusion_matrix_rows_true_cols_predicted": confusion_matrix(
-            true_labels, predicted_labels, labels=[0, 1]
-        ).tolist(),
     }
 
 
@@ -68,8 +67,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactively classify candidate answers as hallucinated or not."
     )
-    parser.add_argument("--model-dir", type=Path,
-                        default=Path("outputs/bert-halueval-qa/model"))
+    parser.add_argument(
+        "--model-dir", type=Path,
+        default=REPOSITORY_ROOT / "outputs" / "bert-halueval-qa" / "model",
+    )
     parser.add_argument("--report-path", type=Path, default=None,
                         help="JSON report path (defaults to a timestamped file in outputs).")
     parser.add_argument("--max-length", type=int, default=256)
@@ -103,14 +104,13 @@ def main() -> None:
                 print("Knowledge, question, and candidate answer must not be empty.\n")
                 continue
 
-            text = (
-                f"Knowledge: {knowledge}\nQuestion: {question}\n"
-                f"Candidate answer: {answer}"
+            encoding = tokenize_example(
+                tokenizer, knowledge, question, answer, args.max_length
             )
-            inputs = tokenizer(
-                text, return_tensors="pt", truncation=True,
-                max_length=args.max_length,
-            ).to(device)
+            inputs = {
+                key: torch.tensor([value], dtype=torch.long, device=device)
+                for key, value in encoding.items()
+            }
             with torch.inference_mode():
                 probabilities = torch.softmax(model(**inputs).logits, dim=-1)[0]
             predicted_label = int(torch.argmax(probabilities).item())

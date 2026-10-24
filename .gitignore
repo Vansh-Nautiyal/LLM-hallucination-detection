@@ -4,3 +4,5 @@ __pycache__/
 outputs/
 .ipynb_checkpoints/
 .env
+*.xml
+tests/
