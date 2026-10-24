@@ -77,6 +77,7 @@ def make_examples(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             f"Missing required HaluEval fields: {sorted(missing)}. "
             f"First record contains: {sample_keys}"
         )
+    
 
     examples: list[dict[str, Any]] = []
     skipped = 0
@@ -85,6 +86,9 @@ def make_examples(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         question = str(row.get("question", "") or "").strip()
         right = str(row.get("right_answer", "") or "").strip()
         hallucinated = str(row.get("hallucinated_answer", "") or "").strip()
+        if not all([knowledge, question, right, hallucinated]):
+            skipped += 1
+            continue
         if not question or (not right and not hallucinated):
             skipped += 1
             continue
@@ -121,6 +125,7 @@ class HaluEvalDataset(Dataset):
         return item
 
 
+''' Old Function
 def split_by_source(examples: list[dict[str, Any]], test_size: float,
                     val_size: float, seed: int):
     """Split by original QA record so paired right/hallucinated answers don't leak."""
@@ -144,7 +149,66 @@ def split_by_source(examples: list[dict[str, Any]], test_size: float,
         [e for e in examples if e["source_id"] in val_set],
         [e for e in examples if e["source_id"] in test_set],
     )
+'''
 
+def split_by_source(
+    examples: list[dict],
+    test_size: float,
+    val_size: float,
+    seed: int,
+):
+    """Split by source ID so paired answers cannot leak across partitions."""
+    source_ids = sorted({e["source_id"] for e in examples})
+
+    if len(source_ids) < 3:
+        raise ValueError("Need at least 3 source records to create data splits.")
+
+    # Every retained source must have exactly one example of each class.
+    labels_per_source = {}
+    for example in examples:
+        labels_per_source.setdefault(example["source_id"], []).append(
+            example["label"]
+        )
+
+    for source_id, labels in labels_per_source.items():
+        if sorted(labels) != [0, 1]:
+            raise ValueError(
+                f"Source {source_id} must have exactly one example "
+                f"of each class; found labels {labels}."
+            )
+
+    # All source groups contain both classes, so stratifying by a
+    # single label per source is unnecessary and incorrect.
+    train_val_ids, test_ids = train_test_split(
+        source_ids,
+        test_size=test_size,
+        random_state=seed,
+        shuffle=True,
+    )
+
+    val_fraction = val_size / (1.0 - test_size)
+
+    train_ids, val_ids = train_test_split(
+        train_val_ids,
+        test_size=val_fraction,
+        random_state=seed,
+        shuffle=True,
+    )
+
+    train_set = set(train_ids)
+    val_set = set(val_ids)
+    test_set = set(test_ids)
+
+    # Explicitly verify that no source appears in multiple partitions.
+    assert train_set.isdisjoint(val_set)
+    assert train_set.isdisjoint(test_set)
+    assert val_set.isdisjoint(test_set)
+
+    return (
+        [e for e in examples if e["source_id"] in train_set],
+        [e for e in examples if e["source_id"] in val_set],
+        [e for e in examples if e["source_id"] in test_set],
+    )
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
@@ -156,7 +220,6 @@ def compute_metrics(eval_pred):
         "f1_hallucinated": f1_score(labels, predictions, pos_label=1, zero_division=0),
         "macro_f1": f1_score(labels, predictions, average="macro", zero_division=0),
     }
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -197,6 +260,37 @@ def main():
     train_examples, val_examples, test_examples = split_by_source(
         examples, args.test_size, args.val_size, args.seed
     )
+
+    # Guard Checks 
+    def source_ids_in(examples):
+        return {e["source_id"] for e in examples}
+
+
+    train_ids = source_ids_in(train_examples)
+    val_ids = source_ids_in(val_examples)
+    test_ids = source_ids_in(test_examples)
+
+    assert train_ids.isdisjoint(val_ids)
+    assert train_ids.isdisjoint(test_ids)
+    assert val_ids.isdisjoint(test_ids)
+
+    for name, partition in [
+        ("train", train_examples),
+        ("validation", val_examples),
+        ("test", test_examples),
+    ]:
+        labels = [e["label"] for e in partition]
+
+        assert labels.count(0) == labels.count(1), (
+            f"{name} partition is not balanced."
+        )
+
+        print(
+            f"{name}: {len(partition)} examples, "
+            f"class 0 = {labels.count(0)}, "
+            f"class 1 = {labels.count(1)}, "
+            f"source records = {len(source_ids_in(partition))}"
+        )
 
     print(f"Source records: {len(records):,}")
     print(f"Classification examples: {len(examples):,}")
