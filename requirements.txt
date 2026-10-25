@@ -3,3 +3,4 @@ transformers>=4.45.0
 scikit-learn>=1.4.0
 numpy>=1.26.0
 accelerate>=1.0.0
+sentencepiece
