@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -79,6 +82,52 @@ class FailOnNonFiniteLoss(TrainerCallback):
             raise FloatingPointError(
                 f"Non-finite validation loss at global step {state.global_step}: {loss}"
             )
+
+
+def _promote_run_outputs(output_dir: Path, staging_dir: Path) -> None:
+    """Replace the final model and reports only after all staged files exist."""
+    required_files = (
+        "test_predictions.csv",
+        "test_results.json",
+        "experiment_metadata.json",
+    )
+    staged_model = staging_dir / "model"
+    if not staged_model.is_dir() or not any(staged_model.iterdir()):
+        raise RuntimeError(f"Staged model is missing or empty: {staged_model}")
+    for filename in required_files:
+        if not (staging_dir / filename).is_file():
+            raise RuntimeError(f"Required staged output is missing: {filename}")
+
+    backup_dir = staging_dir / "previous-output"
+    backup_dir.mkdir()
+    targets = [(staged_model, output_dir / "model")]
+    targets.extend(
+        (staging_dir / filename, output_dir / filename)
+        for filename in required_files
+    )
+    backed_up: list[tuple[Path, Path]] = []
+    promoted: list[Path] = []
+    try:
+        for staged_path, destination in targets:
+            if destination.exists():
+                if destination.is_dir() != staged_path.is_dir():
+                    raise RuntimeError(
+                        f"Cannot safely replace output with incompatible type: {destination}"
+                    )
+                backup_path = backup_dir / destination.name
+                os.replace(destination, backup_path)
+                backed_up.append((backup_path, destination))
+            os.replace(staged_path, destination)
+            promoted.append(destination)
+    except BaseException:
+        for destination in reversed(promoted):
+            if destination.is_dir():
+                shutil.rmtree(destination)
+            elif destination.exists():
+                destination.unlink()
+        for backup_path, destination in reversed(backed_up):
+            os.replace(backup_path, destination)
+        raise
 
 
 def _parse_args() -> argparse.Namespace:
@@ -278,6 +327,10 @@ def main() -> None:
         trainer_options["tokenizer"] = tokenizer
     trainer = Trainer(**trainer_options)
 
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(
+        tempfile.mkdtemp(prefix=".run-staging-", dir=args.output_dir)
+    )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     training_started = time.perf_counter()
@@ -286,8 +339,9 @@ def main() -> None:
     peak_memory = peak_gpu_memory_mb(device)
 
     final_model_dir = args.output_dir / "model"
-    trainer.save_model(str(final_model_dir))
-    tokenizer.save_pretrained(str(final_model_dir))
+    staged_model_dir = staging_dir / "model"
+    trainer.save_model(str(staged_model_dir))
+    tokenizer.save_pretrained(str(staged_model_dir))
 
     test_result, inference_latency = measure_inference_latency(
         lambda: trainer.predict(test_dataset),
@@ -303,7 +357,7 @@ def main() -> None:
     report = generate_classification_report(true_labels, predicted_labels)
     matrix = generate_confusion_matrix(true_labels, predicted_labels)
     save_test_predictions(
-        args.output_dir / "test_predictions.csv",
+        staging_dir / "test_predictions.csv",
         test_examples,
         true_labels,
         predicted_labels,
@@ -340,12 +394,18 @@ def main() -> None:
         "best_checkpoint": trainer.state.best_model_checkpoint,
     }
     save_evaluation_results(
-        args.output_dir / "test_results.json",
+        staging_dir / "test_results.json",
         metrics=metrics,
         report=report,
         matrix=matrix,
         metadata=metadata,
     )
+
+    _promote_run_outputs(args.output_dir, staging_dir)
+    shutil.rmtree(staging_dir)
+    checkpoints_dir = args.output_dir / "checkpoints"
+    if checkpoints_dir.is_dir():
+        shutil.rmtree(checkpoints_dir)
 
     print("\nFinal test metrics:")
     for name, value in metrics.items():
